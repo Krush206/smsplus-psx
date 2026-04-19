@@ -1,0 +1,14 @@
+
+ To compile:
+
+ PSX: You'll need to make an archive file called 'libpsx.a' with the
+      'syscall.o' and '_start.o' objects added. These come with mipsgcc.
+
+      You may get better performance using another compiler like psyq,
+      since currently mipsgcc crashes when trying to compile the Z80
+      emulator with any optimization level higher than -O1. I'm not
+      sure if this is a limitation of the compiler or simply a memory
+      problem. (too small stack size for the compiler executable)
+
+ DOS: You'll need Allegro, SEAL and zlib. The fileutils package is needed
+      for the 'clean' target in the makefile.
