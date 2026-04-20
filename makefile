@@ -9,22 +9,18 @@ SRC =	./render.c \
 	./sms.c
 OBJ =	$(SRC:.c=.o)
 
-all: $(OBJ) cpu psx
+all: $(OBJ)
+	$(MAKE) -C ./cpu
+	$(MAKE) -C ./psx
 	$(LD) -r ./*.o \
 		 ./psx/*.o \
 		 ./cpu/*.o \
 		 /usr/local/mipsel-unknown-ecoff/lib/libps.a \
 		 /usr/local/lib/gcc-lib/mipsel-unknown-ecoff/egcs-2.91.66/libgcc.a
-	$(LD) -o smsplus -Ttext 0x80100000 --entry main a.out
+	$(LD) -o smsplus -Ttext 0x80100000 -e main a.out
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(OPT) $<
-
-cpu:
-	$(MAKE) -C ./cpu
-
-psx:
-	$(MAKE) -C ./psx
 
 clean:
 	$(MAKE) -C ./cpu clean
