@@ -13,7 +13,8 @@ all: $(OBJ) cpu psx
 	$(LD) -r ./*.o \
 		 ./psx/*.o \
 		 ./cpu/*.o \
-		 /usr/local/mipsel-unknown-ecoff/lib/libps.a
+		 /usr/local/mipsel-unknown-ecoff/lib/libps.a \
+		 /usr/local/lib/gcc-lib/mipsel-unknown-ecoff/egcs-2.91.66/libgcc.a
 	$(LD) -o smsplus -Ttext 0x80100000 --entry main a.out
 
 %.o: %.c
