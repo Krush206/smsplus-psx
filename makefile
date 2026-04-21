@@ -12,12 +12,13 @@ OBJ =	$(SRC:.c=.o)
 all: $(OBJ)
 	$(MAKE) -C ./cpu
 	$(MAKE) -C ./psx
-	$(LD) -r ./*.o \
+	$(LD) -o smsplus \
+		 -T/usr/local/mipsel-unknown-ecoff/lib/ldscripts/mipspsx.x \
+		 ./*.o \
 		 ./psx/*.o \
 		 ./cpu/*.o \
 		 /usr/local/mipsel-unknown-ecoff/lib/libps.a \
 		 /usr/local/lib/gcc-lib/mipsel-unknown-ecoff/egcs-2.91.66/libgcc.a
-	$(LD) -o smsplus -Ttext 0x80100000 -e main a.out
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(OPT) $<
