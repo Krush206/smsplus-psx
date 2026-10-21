@@ -49,7 +49,9 @@ void sms_frame(int skip_render)
         int count;
 
         SN76496Update(0, snd.psg_buffer, snd.bufsize, sms.psg_mask);
-        if(sms.use_fm) YM3812UpdateOne(ym3812, snd.fm_buffer, snd.bufsize);
+        /* PSXLinux port: ym3812 is NULL when FM support is disabled
+         * (see audio_init in system.c), so guard the update call */
+        if(sms.use_fm && ym3812) YM3812UpdateOne(ym3812, snd.fm_buffer, snd.bufsize);
 
         for(count = 0; count < snd.bufsize; count += 1)
         {
