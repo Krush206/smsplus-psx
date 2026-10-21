@@ -11,6 +11,7 @@
 #define I_MASK      (*(volatile unsigned int *)0x1F801074)
 
 #define IRQ_VBL     0x001u          /* not used (VSync polls GPUSTAT) */
+#define IRQ_DMA     0x008u
 #define IRQ_CTRL    0x080u
 #define IRQ_SPU     0x200u
 
