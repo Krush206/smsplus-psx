@@ -79,9 +79,18 @@ void audio_init(int rate)
     /* Set up SN76489 emulation */
     SN76496_init(0, MASTER_CLOCK, 255, rate);
 
+    /* PSXLinux port note: the YM3812 emulator allocates ~62KB of
+     * dynamic tables (TL/SIN/AMS/VIB), which cannot fit in the ECOFF
+     * user window alongside the emulator state, so FM (Mark-III
+     * expansion) support is disabled on this target and the sound
+     * path is PSG-only.  ym3812 stays NULL; every use is guarded. */
+#ifndef PSXLINUX
     /* Set up YM3812 emulation */
     ym3812 = OPLCreate(OPL_TYPE_YM3812, MASTER_CLOCK, rate);
     if(!ym3812) return;
+#else
+    ym3812 = NULL;
+#endif
 
     /* Set up YM2413 emulation */
     ym2413_init(1);
@@ -104,9 +113,10 @@ void system_reset(void)
     sms_reset();
     render_reset();
     system_load_sram();
+    /* PSXLinux port: ym3812 is NULL when FM support is disabled */
     if(snd.enabled)
     {
-        OPLResetChip(ym3812);
+        if(ym3812) OPLResetChip(ym3812);
         ym2413_reset(0);
     }
 }
