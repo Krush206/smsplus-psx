@@ -98,6 +98,14 @@ unsigned char *cpu_writemap[8];
 #define BIG_FLAGS_ARRAY         0
 #endif
 
+/* PSXLinux port: the big flag arrays cost 2*64K of heap which does not
+ * fit in the 1MB user window the PSXLinux kernel gives us, so use the
+ * small (computed) flag path, exactly like the bare-metal PSX port. */
+#ifdef PSXLINUX
+#undef  BIG_FLAGS_ARRAY
+#define BIG_FLAGS_ARRAY         0
+#endif
+
 #define CF  0x01
 #define NF	0x02
 #define PF	0x04
