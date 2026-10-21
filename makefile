@@ -13,12 +13,12 @@ all: $(OBJ)
 	$(MAKE) -C ./cpu
 	$(MAKE) -C ./psx
 	$(LD) -o smsplus \
-		 -T/usr/local/mipsel-unknown-ecoff/lib/ldscripts/mipspsx.x \
+		 -T/usr/local/mipsel-ecoff/lib/ldscripts/mipspsx.x \
 		 ./*.o \
 		 ./psx/*.o \
 		 ./cpu/*.o \
-		 /usr/local/mipsel-unknown-ecoff/lib/libps.a \
-		 /usr/local/lib/gcc-lib/mipsel-unknown-ecoff/egcs-2.91.66/libgcc.a
+		 libps_patched.a \
+		 /usr/local/lib/gcc-lib/mipsel-ecoff/egcs-2.91.66/libgcc.a
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(OPT) $<
