@@ -21,7 +21,6 @@
 #include "psxsys.h"
 
 /* spu.c: produced-slot counter (for the audio breadcrumb) */
-extern int spu_dbg_slots;
 
 /* not in psxsys.h (the reference SDK header stays untouched) */
 static int sys_lseek(int fd, int offset, int whence)
@@ -123,17 +122,14 @@ static void dma_to_gpu(const void *addr, unsigned words)
     I_STAT = ~IRQ_DMA;                      /* ack the completion IRQ */
 }
 
-static unsigned ds_spins;               /* diagnostics: poll iterations */
 
 static void drawsync_wait(void)
 {
     int i;
 
-    for (i = 0; i < 200000; i++) {
+    for (i = 0; i < 200000; i++)
         if (GPUSTAT & 0x04000000u)          /* bit26: GPU ready, not busy */
             return;
-        ds_spins++;
-    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -150,11 +146,6 @@ static void drawsync_wait(void)
  * overflow, so single-wrap detection is always valid.        */
 
 #define T1_COUNT     (*(volatile unsigned short *)0x1F801110)
-
-/* DIAGNOSTIC: wall clock.  PSXLinux has no MMU, so the program can read
- * the kernel's 100 Hz jiffies counter directly (System.map: 0xb72b4).
- * Used only to report real frames/second; not part of the emulator. */
-#define KJIFFIES     (*(volatile unsigned *)0x800B72B4)
 #define T1_MODE      (*(volatile unsigned short *)0x1F801114)
 #define T1_HBLANK    0x0100                    /* bit8: hblank source */
 #define HBLANKS_FRAME    262
@@ -205,37 +196,7 @@ static void pace_frame(void)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* GPU breadcrumbs: small absolute-coordinate color marks along the   */
-/* top edge of VRAM (y 0..8), visible in the frontend frame dumps so   */
-/* hangs can be localized without a working console.                   */
-/* ------------------------------------------------------------------ */
-
-/* A0-based breadcrumb: an 8-pixel colored strip uploaded through a
- * tiny CPU->VRAM transfer.  The old fill-based marks turned out to be
- * invisible in the frontend dumps (peops only schedules a presentation
- * when a VRAM transfer completes or the display mode changes), so each
- * mark here completes an A0 transfer and is guaranteed to be dumped. */
 static void vram_upload_img(int x, int y, int w, int h, const void *pix, int pitch);
-
-static void bc_row(int slot, int row, int r, int g, int b)
-{
-    unsigned short hw[4];
-    unsigned x = 8u * (unsigned)slot;
-    unsigned y = 8u * (unsigned)row;
-    unsigned c = (unsigned short)(((b >> 3) << 10) | ((g >> 3) << 5) | (r >> 3));
-
-    hw[0] = (unsigned short)c;
-    hw[1] = (unsigned short)c;
-    hw[2] = (unsigned short)c;
-    hw[3] = (unsigned short)c;
-    vram_upload_img((int)x, (int)y, 4, 1, hw, 8);   /* 4 halfwords x 1 row */
-}
-
-static void bc(int slot, int r, int g, int b)
-{
-    bc_row(slot, 0, r, g, b);
-}
 
 static void set_draw_area(void);
 static void set_draw_offset(void);
@@ -347,19 +308,6 @@ static void vram_upload_img(int x, int y, int w, int h, const void *pix, int pit
 #define TEX_TPAGE   ((((unsigned)(TEX_X >> 6)) & 0x0F) | \
                      ((((unsigned)(TEX_Y >> 8)) & 0x01) << 4) | (1u << 7))
 
-/* Textured rectangle (64h, variable size, raw).  Rectangles sample
- * texture 1:1 (U/V advance one texel per pixel), so this cannot scale;
- * it is used for the self-test sprite only. */
-static void draw_sprite(int x, int y, int u, int v, int w, int h,
-                        unsigned tpage, unsigned clut)
-{
-    gp0_cmd(0xE1000000u | tpage);           /* tpage + 8bpp color mode  */
-    gp0_cmd(0x64808080u);                   /* modulate = identity      */
-    gp0_cmd(((unsigned)y << 16) | x);
-    gp0_cmd((clut << 16) | ((unsigned)(v & 0xFF) << 8) | (unsigned)(u & 0xFF));
-    gp0_cmd(((unsigned)h << 16) | w);
-}
-
 /* Textured quad (2Ch).  Unlike a rectangle this carries a UV per
  * corner, so the GPU interpolates U/V.  Kept for reference: peops'
  * 8bpp polygon path does not draw our packets (the rectangle path
@@ -417,38 +365,6 @@ static void update_clut(void)
     vram_upload_img(CLUT_X, CLUT_Y, 128, 1, clut_hw, 256);
 }
 
-/* Self-test sprite: 16x16 8bpp texture of color index 1 with its own
- * two-entry CLUT, drawn at a fixed screen position.  If the game area
- * stays black but this green block appears, the sprite/texture/CLUT
- * path is fine and the bitmap data (not the presentation) is empty. */
-#define ST_X        640                  /* self-test texture  */
-#define ST_Y        0
-#define ST_CLUT_X   640
-#define ST_CLUT_Y   208
-#define ST_TPAGE    ((((unsigned)(ST_X >> 6)) & 0x0F) | (1u << 7))
-#define ST_CLUT_ATTR (((unsigned)ST_CLUT_Y << 6) | ((unsigned)(ST_CLUT_X >> 4) & 0x3F))
-
-static void draw_selftest(void)
-{
-    static unsigned short tex[8 * 16];   /* 16 texels = 8 halfwords/row */
-    static unsigned short clut[16];
-    static int ready;
-    int i;
-
-    if (!ready) {
-        for (i = 0; i < 8 * 16; i++)
-            tex[i] = 0x0101;             /* texels 1,1 -> CLUT entry 1 */
-        clut[0] = 0x0000;                /* transparent */
-        clut[1] = 0x03E0;                /* pure green  */
-        for (i = 2; i < 16; i++)
-            clut[i] = 0x7FFF;
-        vram_upload_img(ST_X, ST_Y, 8, 16, tex, 16);
-        vram_upload_img(ST_CLUT_X, ST_CLUT_Y, 16, 1, clut, 32);
-        ready = 1;
-    }
-    draw_sprite(200, 150, 0, 0, 16, 16, ST_TPAGE, ST_CLUT_ATTR);
-}
-
 static void update_video(void)
 {
     int w_tex, h_tex, w_dst, h_dst;
@@ -478,18 +394,6 @@ static void update_video(void)
     w_dst = (w_tex * 5) / 4;
     h_dst = (h_tex * 5) / 4;
     draw_bitmap_quad(w_tex, h_tex, w_dst, h_dst, TEX_TPAGE, CLUT_ATTR);
-
-    draw_selftest();
-
-    /* identity marker: steady visibility in both buffers (offsets are
-     * ignored by fill rects, so absolute coords cover each buffer's
-     * bottom-right corner).  Marker stays until a flush; it blinks
-     * exactly when the wrong buffer is drawn. */
-    GP0 = 0x02A000F0u;                    /* B=0xA0 G=0x00 R=0xF0 */
-    GP0 = ((unsigned)(CONSOLE_H - 16) << 16) | (unsigned)(CONSOLE_W - 4);
-    GP0 = (16u << 16) | 4u;               /* buffer 0 (H<<16)|W */
-    GP0 = ((unsigned)(CONSOLE_H * 2 - 16) << 16) | (unsigned)(CONSOLE_W - 4);
-    GP0 = (16u << 16) | 4u;               /* buffer 1 */
 }
 
 /* ------------------------------------------------------------------ */
@@ -664,11 +568,9 @@ static void load_rom(void)
             break;
     }
     if (fd < 0 || i == 6) {
-        bc(20, 255, 255, 255);           /* no ROM found */
         printf("No ROM image found (place game.sms on the CD root)\n");
         for (;;) ;                              /* stop here, visibly */
     }
-    bc(3, 255, 255, 0);                 /* sys_open succeeded */
 
     st.size = 0;
     {
@@ -676,7 +578,6 @@ static void load_rom(void)
         printf("fstat rc=%d size=%d\n", fstat_rc, st.size);
     }
     size = st.size;
-    bc(4, 0, 255, 255);                 /* sys_fstat returned */
 
     printf("ROM: %s, %d bytes\n", rom_names[i], size);
 
@@ -693,7 +594,6 @@ static void load_rom(void)
         printf("Image too large, truncated to %d bytes\n", size);
     }
 
-    bc(5, 255, 0, 255);                  /* before the big sys_read */
 
     /* The kernel's ISO read path can return short, and - worse - its
      * CD data-interrupt handling can race and deliver zeroed sectors
@@ -743,14 +643,11 @@ static void load_rom(void)
             }
         }
 
-        if (got == size && unconfirmed == 0) {
-            if (repairs == 0)
-                bc(19, 0, 255, 0);       /* clean read */
-            else
-                bc(19, 255, 128, 0);      /* verified, repairs needed */
-        } else {
-            bc(19, 255, 0, 0);           /* unreadable chunk(s) */
-        }
+        if (got == size && unconfirmed == 0)
+            printf("ROM verified, %d chunk repairs\n", repairs);
+        else
+            printf("ROM UNREADABLE: %d bytes short, %d chunks unconfirmed\n",
+                   size - got, unconfirmed);
     }
     sys_close(fd);
 
@@ -784,13 +681,9 @@ int main(int argc, char *argv[])
     GP0 = 0xE4000000 | ((unsigned)CONSOLE_H << 10) | CONSOLE_W;
     GP0 = 0xE5000000;
 
-    bc(0, 255, 0, 0);                   /* reached main() */
     printf("SMS Plus %s PSXLinux port\n", VERSION);
-    bc(1, 0, 255, 0);                  /* printf survived */
     gpu_init();
-    bc(2, 0, 0, 255);
     load_rom();
-    bc(6, 255, 255, 255);
 
     /* Set up display bitmap (dimensions depend on the cartridge type) */
     memset(&bitmap, 0, sizeof(t_bitmap));
@@ -810,11 +703,6 @@ int main(int argc, char *argv[])
      * is what makes the SELECT+START toggle in update_input() safe at
      * any time. */
     snd.enabled = 0;
-    bc(7, 255, 128, 0);
-    if (snd.enabled)
-        bc(17, 0, 255, 0);              /* sound buffers allocated OK */
-    else
-        bc(17, 255, 0, 0);
 
     /* Reset the console AFTER the cart is loaded: cpu_reset() maps the
      * ROM pages (and vdp/sms/render state) for the loaded image.  The
@@ -824,66 +712,13 @@ int main(int argc, char *argv[])
     system_reset();
 
     spu_init();
-    bc(8, 128, 0, 0);
     pace_init();                        /* frame pacing via Timer 1 */
-    bc(9, 0, 128, 128);
-
-    /* Timer 1 health report (green = good, red = bad):
-     *   slot 13: T1_MODE bit8 (hblank clock select) reads back
-     *   slot 14: T1_COUNT changes while burning CPU cycles
-     *   slot 15: T1 advances >= 10 ticks in the burn window
-     *   slot 16: T1 advances >= 262 ticks (one field) in ~40 ms */
-    {
-        unsigned c0, c1;
-        int j;
-
-        if (T1_MODE & T1_HBLANK)
-            bc(13, 0, 255, 0);
-        else
-            bc(13, 255, 0, 0);
-
-        c0 = T1_COUNT;
-        for (j = 0; j < 400000; j++)    /* ~ 15 ms */
-            ;
-        c1 = T1_COUNT;
-        if (c1 != c0)
-            bc(14, 0, 255, 0);
-        else
-            bc(14, 255, 0, 0);
-        {
-            int d = (int)(c1 - c0);
-            if (d < 0) d += 0x10000;
-            if (d >= 10)
-                bc(15, 0, 255, 0);
-            else
-                bc(15, 255, 0, 0);
-        }
-
-        c0 = T1_COUNT;
-        for (j = 0; j < 1200000; j++)   /* ~ 45 ms */
-            ;
-        c1 = T1_COUNT;
-        {
-            int d = (int)(c1 - c0);
-            if (d < 0) d += 0x10000;
-            if (d >= HBLANKS_FRAME)
-                bc(16, 0, 255, 0);
-            else
-                bc(16, 255, 0, 0);
-        }
-    }
 
     /* Main emulation loop */
     {
-        int first = 1;
-        int audio_reported = 0;
-        int cram_reported = 0;
-        int last_stall = 0;
         unsigned frame = 0;
-        unsigned last_pc = 0;
         unsigned t_video = 0, t_sms = 0, t_loop = 0;
-        unsigned t_wait = 0, t_in = 0, t_spu = 0, t_dbg = 0;
-        unsigned last_j = KJIFFIES;
+        unsigned t_wait = 0, t_in = 0, t_spu = 0;
         unsigned prev_top = T1_COUNT;  /* loop start of last iteration */
         unsigned iter_ticks = 0;       /* its length in hblank ticks */
         int skip_run = 0;              /* consecutive skipped renders */
@@ -961,29 +796,8 @@ int main(int argc, char *argv[])
                 t_spu += (unsigned short)(T1_COUNT - t0);
             }
 
-            {
-            unsigned t0 = T1_COUNT;
+            frame++;
 
-            /* breadcrumbs for the loop phase: each mark is an A0
-             * upload, so it is guaranteed to appear in a dump */
-            if (first) {
-                bc(10, 128, 255, 0);            /* first frame done */
-                first = 0;
-            }
-            if (!audio_reported && spu_dbg_slots >= 16) {
-                bc(18, 0, 255, 0);               /* 16 ADPCM slots streamed */
-                audio_reported = 1;
-            }
-            if ((++frame & 255) == 0)
-                bc(11, 128, 0, 255);            /* still alive */
-            if (pace_stalled != last_stall) {
-                last_stall = pace_stalled;
-                bc(12, 255, 0, 255);
-            }
-            if (!cram_reported && (game_activity & 1)) {
-                bc(21, 0, 128, 255);         /* game is executing + writing CRAM */
-                cram_reported = 1;
-            }
             /* Rendering/speed diagnostics, once per 128 frames:
              *   nz  = non-zero bytes in the SMS bitmap (core output?)
              *   act = game wrote CRAM, st = pacing give-ups
@@ -995,9 +809,9 @@ int main(int argc, char *argv[])
                 for (i = 0; i < 256 * 192; i++)
                     if (bitmap.data[i])
                         nz++;
-                printf("F%u nz=%d ms=%u t1=%u u=%u s=%u w=%u i=%u a=%u d=%u q=%u sk=%d act=%d st=%d p0=%02x%02x%02x\n",
-                       frame, nz, (KJIFFIES - last_j) * 10u, t_loop, t_video, t_sms,
-                       t_wait, t_in, t_spu, t_dbg, ds_spins, skip_count,
+                printf("F%u nz=%d t1=%u u=%u s=%u w=%u i=%u a=%u sk=%d act=%d st=%d p0=%02x%02x%02x\n",
+                       frame, nz, t_loop, t_video, t_sms,
+                       t_wait, t_in, t_spu, skip_count,
                        game_activity, pace_stalled,
                        bitmap.pal.color[0][0], bitmap.pal.color[0][1],
                        bitmap.pal.color[0][2]);
@@ -1007,89 +821,7 @@ int main(int argc, char *argv[])
                 t_wait = 0;
                 t_in = 0;
                 t_spu = 0;
-                t_dbg = 0;
-                ds_spins = 0;
                 skip_count = 0;
-                last_j = KJIFFIES;
-            }
-            /* Z80 liveness: sample the PC every 64 frames; mark the low
-             * 8 bits as bars plus "changed since last sample". */
-            if (frame == 1 || (frame & 15) == 0) {
-                unsigned pc = z80_get_pc();
-                unsigned sp = z80_get_reg(Z80_SP);
-                unsigned af = z80_get_reg(Z80_AF);
-                int b;
-
-                if (pc != last_pc)
-                    bc(23, 0, 255, 0);       /* PC moved */
-                else
-                    bc(23, 255, 0, 0);       /* PC stuck */
-                last_pc = pc;
-                for (b = 0; b < 8; b++)
-                    if (pc & (1u << b))
-                        bc(24 + b, 0, 255, 0);
-                /* PC high byte (bits 8-15) as bars on row 1, slots 0-7
-                 * (row 0 would be full) */
-                for (b = 0; b < 8; b++)
-                    if (pc & (0x100u << b))
-                        bc_row(b, 1, 0, 255, 0);
-
-                /* VDP state: display enable (reg1 bit6), backdrop
-                 * colour (reg7 low 4 bits), vblank flag */
-                if (vdp.reg[1] & 0x40)
-                    bc(32, 0, 255, 0);       /* display ON */
-                else
-                    bc(32, 255, 0, 0);       /* still blanked */
-                for (b = 0; b < 4; b++)
-                    if (vdp.reg[7] & (1u << b))
-                        bc(33 + b, 0, 255, 0);
-                if (vdp.status & 0x80)
-                    bc(37, 0, 255, 0);       /* vblank seen */
-
-                /* console text channel (appears in the pcsx log) */
-                printf("Z8 pc=%04x sp=%04x af=%04x bc=%02x%02x%02x%02x d=%d s=%02x\n",
-                       pc, sp, af, sms.fcr[0], sms.fcr[1], sms.fcr[2],
-                       sms.fcr[3], (vdp.reg[1] & 0x40) != 0, vdp.status);
-            }
-
-            /* one-shot loader-proof: green bars, rows 0-1: per-page
-             * checksum bits (page 0-4 row 0, page 5-7 row 1) so the
-             * host can compare the port's ROM against the file's */
-            if (frame == 45) {
-                int p, b;
-
-                for (p = 0; p < 8; p++)
-                    for (b = 0; b < 8; b++)
-                        if ((page_sums[p] >> b) & 1u)
-                            bc_row((p < 5) ? p * 8 + b : (p - 5) * 8 + b,
-                                   p < 5 ? 0 : 1, 0, 255, 0);
-            }
-
-            /* one-shot crash-state snapshot (cyan bars, rows 0-1):
-             * 64 bits = PC[15:0], SP[15:0], AF[15:0], fcr[0..3] 4 bits
-             * each.  Fired at frame 97 so it lands between periodic
-             * samples and never collides with the green marks. */
-            if (frame == 97) {
-                unsigned sp = z80_get_reg(Z80_SP);
-                unsigned af = z80_get_reg(Z80_AF);
-                unsigned words[4];
-                int s, b;
-
-                words[0] = z80_get_pc();
-                words[1] = sp;
-                words[2] = af;
-                words[3] = ((unsigned)sms.fcr[3] << 12) |
-                           ((unsigned)sms.fcr[2] << 8)  |
-                           ((unsigned)sms.fcr[1] << 4)  |
-                            (unsigned)sms.fcr[0];
-                s = 0;
-                for (b = 0; b < 4; b++)
-                    for (; s < (b + 1) * 16; s++)
-                        if (words[b] & (1u << (s & 15)))
-                            bc_row(s % 40, s / 40, 0, 255, 255);
-            }
-
-            t_dbg += (unsigned short)(T1_COUNT - t0);
             }
 
             t_loop += (unsigned short)(T1_COUNT - t0_loop);
