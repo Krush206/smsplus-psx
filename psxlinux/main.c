@@ -99,19 +99,41 @@ static void gp0_cmd(unsigned v)
     GP0 = v;
 }
 
-static void gp0_data(unsigned v)
+/* GPU DMA channel 2 (block mode, RAM -> GP0).  Preparing a packet in
+ * RAM and letting DMA feed it to the GPU costs one call into the GPU
+ * plugin instead of one per word: the 12K word texture upload used to
+ * dominate the frame time. */
+#define DMA2_MADR   (*(volatile unsigned int *)0x1F8010A0)
+#define DMA2_BCR    (*(volatile unsigned int *)0x1F8010A4)
+#define DMA2_CHCR   (*(volatile unsigned int *)0x1F8010A8)
+#define DPCR        (*(volatile unsigned int *)0x1F8010F0)
+
+#define DMA_CHCR_START  0x01000000u
+#define DMA2_MEM2GPU    0x01000201u    /* block, forward, 32-bit       */
+#define DPCR_CH2        0x0F00u        /* channel 2 priority 7 + on    */
+
+/* One channel-2 block DMA to the GPU data port.  The transfer itself is
+ * done by the time this returns (the plugin consumes it synchronously),
+ * so there is nothing to poll. */
+static void dma_to_gpu(const void *addr, unsigned words)
 {
-    gpu_ready_wait();
-    GP0 = v;
+    DMA2_MADR = (unsigned)addr;
+    DMA2_BCR  = (1u << 16) | words;         /* one block */
+    DMA2_CHCR = DMA2_MEM2GPU;
+    I_STAT = ~IRQ_DMA;                      /* ack the completion IRQ */
 }
+
+static unsigned ds_spins;               /* diagnostics: poll iterations */
 
 static void drawsync_wait(void)
 {
     int i;
 
-    for (i = 0; i < 200000; i++)
-        if ((GPUSTAT & 0x04000000u) == 0)   /* bit26: not drawing */
+    for (i = 0; i < 200000; i++) {
+        if (GPUSTAT & 0x04000000u)          /* bit26: GPU ready, not busy */
             return;
+        ds_spins++;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -128,6 +150,11 @@ static void drawsync_wait(void)
  * overflow, so single-wrap detection is always valid.        */
 
 #define T1_COUNT     (*(volatile unsigned short *)0x1F801110)
+
+/* DIAGNOSTIC: wall clock.  PSXLinux has no MMU, so the program can read
+ * the kernel's 100 Hz jiffies counter directly (System.map: 0xb72b4).
+ * Used only to report real frames/second; not part of the emulator. */
+#define KJIFFIES     (*(volatile unsigned *)0x800B72B4)
 #define T1_MODE      (*(volatile unsigned short *)0x1F801114)
 #define T1_HBLANK    0x0100                    /* bit8: hblank source */
 #define HBLANKS_FRAME    262
@@ -189,7 +216,7 @@ static void pace_frame(void)
  * invisible in the frontend dumps (peops only schedules a presentation
  * when a VRAM transfer completes or the display mode changes), so each
  * mark here completes an A0 transfer and is guaranteed to be dumped. */
-static void vram_upload_img(int x, int y, int w, int h, const unsigned short *hw);
+static void vram_upload_img(int x, int y, int w, int h, const void *pix, int pitch);
 
 static void bc_row(int slot, int row, int r, int g, int b)
 {
@@ -202,7 +229,7 @@ static void bc_row(int slot, int row, int r, int g, int b)
     hw[1] = (unsigned short)c;
     hw[2] = (unsigned short)c;
     hw[3] = (unsigned short)c;
-    vram_upload_img((int)x, (int)y, 4, 1, hw);   /* 4 halfwords x 1 row */
+    vram_upload_img((int)x, (int)y, 4, 1, hw, 8);   /* 4 halfwords x 1 row */
 }
 
 static void bc(int slot, int r, int g, int b)
@@ -230,7 +257,7 @@ static void gpu_init(void)
     /* clip both buffers and use an absolute (0,0) offset for the
      * initial clear */
     GP0 = 0xE3000000;                       /* top-left (0,0) */
-    GP0 = 0xE4000000 | (((unsigned)(BUF_Y1 + CONSOLE_H)) << 11) | CONSOLE_W;
+    GP0 = 0xE4000000 | (((unsigned)(BUF_Y1 + CONSOLE_H)) << 10) | CONSOLE_W;
     GP0 = 0xE5000000;
 
     /* blank every visible line so the first frames are black: fill
@@ -266,35 +293,99 @@ static void gpu_flip(int y)
     GP1 = 0x05000000 | (y << 10);
 }
 
-/* CPU -> VRAM transfer: w halfwords per row, h rows, image row-packed.
- * A0 packet layout (3 setup words, then data):
- *   word0 = 0xA0000000 (command; low bits unused)
- *   word1 = (y << 16) | x      destination
- *   word2 = (h << 16) | w      size, w in halfwords, then w*h data words
- * Getting this wrong leaves the GPU mid-transfer, swallowing every
- * later GP0 word as pixel data (observed the hard way). */
-static void vram_upload_img(int x, int y, int w, int h, const unsigned short *hw)
+/* CPU -> VRAM transfer.  The packet (A0 header + pixel data) is built
+ * in dma_buf and fed to the GPU with one channel-2 DMA call:
+ *   A0 layout: word0 = 0xA0000000, word1 = (y<<16)|x, word2 = (h<<16)|w
+ *   (w in halfwords), then w*h halfwords, two per 32-bit word.
+ * Getting the packing wrong leaves the GPU mid-transfer, swallowing
+ * every later GP0 word as pixel data (observed the hard way). */
+static void vram_upload_img(int x, int y, int w, int h, const void *pix, int pitch)
 {
-    int i, total = w * h;
+    const unsigned char *src = (const unsigned char *)pix;
+    int wpr = (w + 1) / 2;              /* 32-bit words per image row */
 
-    gp0_cmd(0xA0000000u);
-    gp0_cmd(((unsigned)y << 16) | (unsigned)x);
-    gp0_cmd(((unsigned)h << 16) | (unsigned)w);
-    for (i = 0; i < total; i++)
-        gp0_data(*hw++);
+    DPCR |= DPCR_CH2;
+    I_MASK &= ~IRQ_DMA;                 /* the kernel has no DMA handler */
+
+    /* The GPU data port takes two 8bpp texels per 32-bit word, which is
+     * exactly the little-endian layout of a byte-per-pixel bitmap row.
+     * When a row is contiguous with the next (pitch == w halfwords) the
+     * whole image goes out as one DMA straight from the caller's buffer,
+     * with no staging copy at all. */
+    if (pitch == w * 2) {
+        gp0_cmd(0xA0000000u);
+        gp0_cmd(((unsigned)y << 16) | (unsigned)x);
+        gp0_cmd(((unsigned)h << 16) | (unsigned)w);
+        dma_to_gpu(pix, (unsigned)(wpr * h));
+        return;
+    }
+
+    /* Otherwise (Game Gear in a 256 byte pitch) send it a row at a time
+     * through a small packet on the stack: a 128 halfword row is 64
+     * words, so the buffer never needs to be larger than that. */
+    {
+        unsigned pkt[3 + 64];
+        int row;
+
+        for (row = 0; row < h; row++) {
+            const unsigned char *s = src + (size_t)row * (size_t)pitch;
+
+            pkt[0] = 0xA0000000u;
+            pkt[1] = ((unsigned)(y + row) << 16) | (unsigned)x;
+            pkt[2] = (1u << 16) | (unsigned)w;
+            memcpy(&pkt[3], s, (size_t)wpr * 4u);
+            dma_to_gpu(pkt, 3u + (unsigned)wpr);
+        }
+    }
 }
 
-/* textured rectangle; sprite coords are screen coords (draw offset
- * applies), u/v texel coords within the tpage */
-static void draw_sprite(int x, int y, int u, int v, int w, int h, unsigned tpage)
+/* CLUT attribute word for the palette at (CLUT_X, CLUT_Y) */
+#define CLUT_ATTR   (((unsigned)CLUT_Y << 6) | ((unsigned)(CLUT_X >> 4) & 0x3F))
+/* tpage for the 8bpp texture at halfword (TEX_X, TEX_Y):
+ * bits 0-3 = page X (64 halfwords), bit 4 = page Y (256 lines),
+ * bits 7-8 = color mode (1 = 8bpp) */
+#define TEX_TPAGE   ((((unsigned)(TEX_X >> 6)) & 0x0F) | \
+                     ((((unsigned)(TEX_Y >> 8)) & 0x01) << 4) | (1u << 7))
+
+/* Textured rectangle (64h, variable size, raw).  Rectangles sample
+ * texture 1:1 (U/V advance one texel per pixel), so this cannot scale;
+ * it is used for the self-test sprite only. */
+static void draw_sprite(int x, int y, int u, int v, int w, int h,
+                        unsigned tpage, unsigned clut)
 {
     gp0_cmd(0xE1000000u | tpage);           /* tpage + 8bpp color mode  */
     gp0_cmd(0x64808080u);                   /* modulate = identity      */
     gp0_cmd(((unsigned)y << 16) | x);
-    /* CLUT at (512,208): attr = (208 << 6) | ((512 >> 4) & 0x3F) = 0x3420,
-     * stored in bits 16-31 of the UV word: word = CLUT<<16 | V<<8 | U */
-    gp0_cmd((0x3420u << 16) | ((unsigned)(v & 0xFF) << 8) | (unsigned)(u & 0xFF));
+    gp0_cmd((clut << 16) | ((unsigned)(v & 0xFF) << 8) | (unsigned)(u & 0xFF));
     gp0_cmd(((unsigned)h << 16) | w);
+}
+
+/* Textured quad (2Ch).  Unlike a rectangle this carries a UV per
+ * corner, so the GPU interpolates U/V.  Kept for reference: peops'
+ * 8bpp polygon path does not draw our packets (the rectangle path
+ * does), so the frontend presents the bitmap with a 1:1 sprite. */
+static void draw_bitmap_quad(int tex_w, int tex_h, int dst_w, int dst_h,
+                             unsigned tpage, unsigned clut)
+{
+    int x0 = (CONSOLE_W - dst_w) / 2;
+    int y0 = (CONSOLE_H - dst_h) / 2;
+    int x1 = x0 + dst_w;
+    int y1 = y0 + dst_h;
+    unsigned u1 = (unsigned)(tex_w - 1);    /* U is 8 bit: 0..255 */
+    unsigned v1 = (unsigned)(tex_h - 1);    /* V is 8 bit: 0..255 */
+
+    /* packet: cmd|color, xy0, uv0|clut, xy1, uv1|tpage, xy2, uv2,
+     * xy3, uv3  (the tpage lives in the high half of the 2nd UV word,
+     * the CLUT in the high half of the 1st, as on real hardware) */
+    gp0_cmd(0x2C808080u);                       /* modulate identity */
+    gp0_cmd(((unsigned)y0 << 16) | (unsigned)x0);
+    gp0_cmd((clut << 16) | 0u);                 /* top-left  (0,0)  */
+    gp0_cmd(((unsigned)y0 << 16) | (unsigned)x1);
+    gp0_cmd((tpage << 16) | u1);                /* top-right        */
+    gp0_cmd(((unsigned)y1 << 16) | (unsigned)x1);
+    gp0_cmd((v1 << 8) | u1);                    /* bottom-right     */
+    gp0_cmd(((unsigned)y1 << 16) | (unsigned)x0);
+    gp0_cmd((v1 << 8) | 0u);                    /* bottom-left      */
 }
 
 /* ------------------------------------------------------------------ */
@@ -306,10 +397,15 @@ static void update_clut(void)
     static unsigned short clut_hw[128];
     int i;
 
-    if (!bitmap.pal.update)
-        return;
-
-    game_activity |= 1;                 /* game wrote its palette */
+    /* always re-upload: 128 halfwords per frame is free compared with
+     * the 24K halfword texture, and it makes the palette independent
+     * of the core's dirty flag (a never-cleared flag used to leave the
+     * GPU CLUT all zero, which makes every texel fully transparent and
+     * the whole screen black) */
+    if (bitmap.pal.update) {
+        game_activity |= 1;                 /* game wrote its palette */
+        bitmap.pal.update = 0;
+    }
 
     for (i = 0; i < 128; i++) {
         int c = i & 0x1F;
@@ -318,13 +414,44 @@ static void update_clut(void)
         unsigned b = bitmap.pal.color[c][2] >> 3;
         clut_hw[i] = (unsigned short)((b << 10) | (g << 5) | r);
     }
-    vram_upload_img(CLUT_X, CLUT_Y, 128, 1, clut_hw);
-    bitmap.pal.update = 0;
+    vram_upload_img(CLUT_X, CLUT_Y, 128, 1, clut_hw, 256);
+}
+
+/* Self-test sprite: 16x16 8bpp texture of color index 1 with its own
+ * two-entry CLUT, drawn at a fixed screen position.  If the game area
+ * stays black but this green block appears, the sprite/texture/CLUT
+ * path is fine and the bitmap data (not the presentation) is empty. */
+#define ST_X        640                  /* self-test texture  */
+#define ST_Y        0
+#define ST_CLUT_X   640
+#define ST_CLUT_Y   208
+#define ST_TPAGE    ((((unsigned)(ST_X >> 6)) & 0x0F) | (1u << 7))
+#define ST_CLUT_ATTR (((unsigned)ST_CLUT_Y << 6) | ((unsigned)(ST_CLUT_X >> 4) & 0x3F))
+
+static void draw_selftest(void)
+{
+    static unsigned short tex[8 * 16];   /* 16 texels = 8 halfwords/row */
+    static unsigned short clut[16];
+    static int ready;
+    int i;
+
+    if (!ready) {
+        for (i = 0; i < 8 * 16; i++)
+            tex[i] = 0x0101;             /* texels 1,1 -> CLUT entry 1 */
+        clut[0] = 0x0000;                /* transparent */
+        clut[1] = 0x03E0;                /* pure green  */
+        for (i = 2; i < 16; i++)
+            clut[i] = 0x7FFF;
+        vram_upload_img(ST_X, ST_Y, 8, 16, tex, 16);
+        vram_upload_img(ST_CLUT_X, ST_CLUT_Y, 16, 1, clut, 32);
+        ready = 1;
+    }
+    draw_sprite(200, 150, 0, 0, 16, 16, ST_TPAGE, ST_CLUT_ATTR);
 }
 
 static void update_video(void)
 {
-    int w_hw, rows, h_screen, y_screen, x_screen;
+    int w_tex, h_tex, w_dst, h_dst;
 
     /* target the current back buffer (clip + draw offset must be reset
      * every frame since the buffer alternates) */
@@ -336,9 +463,9 @@ static void update_video(void)
 
     update_clut();
 
-    w_hw  = cart.type ? 80 : 128;
-    rows  = cart.type ? 144 : 192;
-    vram_upload_img(TEX_X, TEX_Y, w_hw, rows, (const unsigned short *)bitmap.data);
+    w_tex = cart.type ? 160 : 256;
+    h_tex = cart.type ? 144 : 192;
+    vram_upload_img(TEX_X, TEX_Y, w_tex / 2, h_tex, bitmap.data, bitmap.pitch);
 
     /* clear the logical back buffer: fill packets use absolute
      * coordinates and ignore the draw offset */
@@ -346,21 +473,13 @@ static void update_video(void)
     gp0_cmd((unsigned)back_y << 16);
     gp0_cmd(((unsigned)CONSOLE_H << 16) | (unsigned)CONSOLE_W);
 
-    /* present at x1.25 (256x192 -> 320x240, 160x144 -> 200x180) */
-    h_screen = (rows * 5) / 4;
-    y_screen = (CONSOLE_H - h_screen) / 2;
+    /* present: stretch the bitmap to the full display with a textured
+     * quad (a rectangle cannot scale: it samples U/V 1:1 per pixel) */
+    w_dst = (w_tex * 5) / 4;
+    h_dst = (h_tex * 5) / 4;
+    draw_bitmap_quad(w_tex, h_tex, w_dst, h_dst, TEX_TPAGE, CLUT_ATTR);
 
-    if (cart.type == TYPE_SMS) {
-        /* 256 texels wide: two 128-texel sprites, 160 pixels each */
-        x_screen = (CONSOLE_W - 320) / 2;               /* 0 */
-        draw_sprite(x_screen, y_screen, 0, 0, 160, h_screen, 0x88);
-        draw_sprite(x_screen + 160, y_screen, 0, 0, 160, h_screen, 0x89);
-    } else {
-        /* 160 texels wide: split 128 + 32 texels (160/40 pixels) */
-        x_screen = (CONSOLE_W - 200) / 2;               /* 60 */
-        draw_sprite(x_screen, y_screen, 0, 0, 160, h_screen, 0x88);
-        draw_sprite(x_screen + 160, y_screen, 0, 0, 40, h_screen, 0x89);
-    }
+    draw_selftest();
 
     /* identity marker: steady visibility in both buffers (offsets are
      * ignored by fill rects, so absolute coords cover each buffer's
@@ -457,7 +576,23 @@ static void update_input(void)
     } else {
         select_hold = 0;
     }
-    if (!(p1 & 0x0008))                /* START  */
+
+    /* PSXLinux port: START while holding SELECT toggles the sound
+     * stream on and off (see the snd.enabled note in main()).  START on
+     * its own keeps its console meaning (pause), so it is ignored as a
+     * toggle key whenever SELECT is held. */
+    {
+        static int start_was_down;
+        int start_down = !(p1 & 0x0008);
+        int select_held = !(p1 & 0x0001);
+
+        if (start_down && !start_was_down && select_held) {
+            snd.enabled ^= 1;
+            printf("sound %s\n", snd.enabled ? "on" : "off");
+        }
+        start_was_down = start_down;
+    }
+    if (!(p1 & 0x0008) && (p1 & 0x0001))  /* START alone */
         input.system |= cart.type ? INPUT_START : INPUT_PAUSE;
     if (!(p1 & 0x0010))
         input.pad[0] |= INPUT_UP;
@@ -666,7 +801,15 @@ int main(int argc, char *argv[])
     bitmap.data   = &bitmap_data[0];
     memset(bitmap.data, 0, bitmap.pitch * bitmap.height);
 
-    system_init(22050);                 /* PSG audio at 22050 Hz */
+    system_init(22050);                /* PSG audio at 22050 Hz */
+    /* PSXLinux port: the PSG update plus the SPU streaming cost about
+     * 16% of a frame on this target, and under the usual host setups
+     * the PSX SPU output is inaudible anyway, so the stream starts out
+     * disabled for speed.  The sound buffers are still allocated here
+     * (snd.enabled only gates the per-frame PSG and SPU work), which
+     * is what makes the SELECT+START toggle in update_input() safe at
+     * any time. */
+    snd.enabled = 0;
     bc(7, 255, 128, 0);
     if (snd.enabled)
         bc(17, 0, 255, 0);              /* sound buffers allocated OK */
@@ -738,6 +881,13 @@ int main(int argc, char *argv[])
         int last_stall = 0;
         unsigned frame = 0;
         unsigned last_pc = 0;
+        unsigned t_video = 0, t_sms = 0, t_loop = 0;
+        unsigned t_wait = 0, t_in = 0, t_spu = 0, t_dbg = 0;
+        unsigned last_j = KJIFFIES;
+        unsigned prev_top = T1_COUNT;  /* loop start of last iteration */
+        unsigned iter_ticks = 0;       /* its length in hblank ticks */
+        int skip_run = 0;              /* consecutive skipped renders */
+        int skip_count = 0;            /* skipped renders this window */
 
         rom_checksums();
         printf("ROM %08x %08x %08x %08x %08x %08x %08x %08x\n",
@@ -745,31 +895,74 @@ int main(int argc, char *argv[])
                page_sums[4], page_sums[5], page_sums[6], page_sums[7]);
 
         for (;;) {
+            unsigned t0_loop;
+
             if (exit_flag)
                 break;
 
+            /* Timer 1 runs at one tick per hblank (262 per NTSC field),
+             * so ticks are the natural unit of emulated frame cost.
+             * It wraps every 65536 ticks, hence the 16-bit delta. */
+            t0_loop = T1_COUNT;
+            iter_ticks = (unsigned short)(t0_loop - prev_top);
+            prev_top = t0_loop;
+
             /* Make sure the GPU finished the frame we are about to show
              * (bounded), then wait out one field period (Timer 1). */
-            drawsync_wait();
-            pace_frame();
+            {
+                unsigned t0 = T1_COUNT;
+                drawsync_wait();
+                pace_frame();
 
-            /* what we just finished drawing becomes visible */
-            gpu_flip(back_y);
+                /* what we just finished drawing becomes visible */
+                gpu_flip(back_y);
+                t_wait += (unsigned short)(T1_COUNT - t0);
+            }
             front_y = back_y;
             back_y  = (back_y == BUF_Y0) ? BUF_Y1 : BUF_Y0;
 
             /* fill the new back buffer */
-            update_video();
+            {
+                unsigned t0 = T1_COUNT;
+                update_video();
+                t_video += (unsigned short)(T1_COUNT - t0);
+            }
 
             /* Get current input */
-            update_input();
+            {
+                unsigned t0 = T1_COUNT;
+                update_input();
+                t_in += (unsigned short)(T1_COUNT - t0);
+            }
 
-            /* Run the SMS emulation for a frame */
-            sms_frame(0);
+            /* Run the SMS emulation for a frame.  Rendering is skipped
+             * adaptively: while an iteration fits into two fields
+             * (about 30 fps) every frame is drawn, and once the
+             * emulator falls behind alternate frames drop their
+             * rendering - never more than three in a row, so the
+             * display can not freeze - trading display rate for game
+             * speed.  (Upstream's PSX frontend shipped a fixed
+             * frame_skip = 32, i.e. it drew one frame in 32.) */
+            {
+                unsigned t0 = T1_COUNT;
+                int skip = (iter_ticks >= 2 * HBLANKS_FRAME) && (skip_run < 3);
+
+                skip_run = skip ? skip_run + 1 : 0;
+                skip_count += skip;
+                sms_frame(skip);
+                t_sms += (unsigned short)(T1_COUNT - t0);
+            }
 
             /* Hand the frame's samples to the SPU streamer */
-            if (snd.enabled)
-                spu_frame(snd.buffer[0], snd.buffer[1], snd.bufsize);
+            {
+                unsigned t0 = T1_COUNT;
+                if (snd.enabled)
+                    spu_frame(snd.buffer[0], snd.buffer[1], snd.bufsize);
+                t_spu += (unsigned short)(T1_COUNT - t0);
+            }
+
+            {
+            unsigned t0 = T1_COUNT;
 
             /* breadcrumbs for the loop phase: each mark is an A0
              * upload, so it is guaranteed to appear in a dump */
@@ -790,6 +983,34 @@ int main(int argc, char *argv[])
             if (!cram_reported && (game_activity & 1)) {
                 bc(21, 0, 128, 255);         /* game is executing + writing CRAM */
                 cram_reported = 1;
+            }
+            /* Rendering/speed diagnostics, once per 128 frames:
+             *   nz  = non-zero bytes in the SMS bitmap (core output?)
+             *   act = game wrote CRAM, st = pacing give-ups
+             *   t1  = Timer-1 hblanks per 128 frames: 33536 means the
+             *         loop keeps up with 60 emulated fields */
+            if ((frame & 127) == 0) {
+                int i, nz = 0;
+
+                for (i = 0; i < 256 * 192; i++)
+                    if (bitmap.data[i])
+                        nz++;
+                printf("F%u nz=%d ms=%u t1=%u u=%u s=%u w=%u i=%u a=%u d=%u q=%u sk=%d act=%d st=%d p0=%02x%02x%02x\n",
+                       frame, nz, (KJIFFIES - last_j) * 10u, t_loop, t_video, t_sms,
+                       t_wait, t_in, t_spu, t_dbg, ds_spins, skip_count,
+                       game_activity, pace_stalled,
+                       bitmap.pal.color[0][0], bitmap.pal.color[0][1],
+                       bitmap.pal.color[0][2]);
+                t_video = 0;
+                t_sms = 0;
+                t_loop = 0;
+                t_wait = 0;
+                t_in = 0;
+                t_spu = 0;
+                t_dbg = 0;
+                ds_spins = 0;
+                skip_count = 0;
+                last_j = KJIFFIES;
             }
             /* Z80 liveness: sample the PC every 64 frames; mark the low
              * 8 bits as bars plus "changed since last sample". */
@@ -867,6 +1088,11 @@ int main(int argc, char *argv[])
                         if (words[b] & (1u << (s & 15)))
                             bc_row(s % 40, s / 40, 0, 255, 255);
             }
+
+            t_dbg += (unsigned short)(T1_COUNT - t0);
+            }
+
+            t_loop += (unsigned short)(T1_COUNT - t0_loop);
         }
     }
 
