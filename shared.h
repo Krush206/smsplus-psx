@@ -15,7 +15,11 @@ typedef unsigned char byte;
 typedef signed short int FMSAMPLE;
 
 /* Nasty hacks so the PSX version will compile */
-#if PSX
+#if PSXLINUX
+#include "psxlinux/port.h"  /* PSXLinux port: types + tiny libc (see psxlinux/) */
+#define fread               /* Save states unsupported: the ISO9660 root fs is read-only */
+#define fwrite
+#elif PSX
 #include "psx/syscall.h"    /* for NULL, malloc(), etc. */
 #define fread               /* No real filesystem :) */
 #define fwrite
