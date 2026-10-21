@@ -41,7 +41,7 @@ mkdir stage
 cp <validated kernel exe> stage/SLID_NET.YAR   # BOOT= entry of SYSTEM.CNF
 printf 'BOOT = cdrom:SLID_NET.YAR;1\nTCB = 4\nEVENT = 16\nSTACK = 801FFFF0\n' \
       > stage/SYSTEM.CNF
-cp smsplus.bflt stage/tuxtest                   # kernel cmdline: init=/tuxtest
+cp smsplus.bflt stage/gltron                   # kernel cmdline: init=/gltron
 cp game.sms stage/game.sms                     # ROM, ISO level 1 (8.3 names)
 cd stage && genisoimage -sysid PLAYSTATION -volid SLID_NET -iso-level 1 \
       -o game.iso .
@@ -53,12 +53,14 @@ opens `game.sms` (also tries `game.gg`, `rom.sms`, ...).
 ## Memory budget (why 128K ROMs)
 
 The ECOFF loader places the image at 0x00100000 and the user stack
-0x4000 above its end, without reserving any of it.  The kernel's page
+0x6000 above its end, without reserving any of it.  The kernel's page
 allocator hands out from the top of RAM (free zone ~0x1B2000..0x200000,
 "312k available" on the stock kernel), so a too-large bss overlaps
 live kernel data (bss zeroing then panics the kernel).  Boot-load
 probes on the stock kernel validated image+stack up to ~0x1860F0; the
-current binary ends at ~0x1AC770 which has proven stable.
+current binary ends at ~0x1A8878 (stack top ~0x1AE878) which has
+proven stable — keep new static buffers small and check the LOAD
+segment `MemSiz` after touching any buffer.
 
 BSS is dominated by: ROM buffer (128K), renderer pattern cache (128K),
 16bpp LUT (64K), emulator contexts (~48K), bitmap (24K), VDP (16K).
@@ -149,11 +151,11 @@ real-hardware smsplus PSX port (`../psx/psx.c`).
   the loader loops short reads and verifies every 8KB chunk by
   re-reading it (up to 4 tries, then a final confirmation read).
 - The kernel has no /dev tree on the ISO (devfs does not mount), so
-  userspace printf falls back to raw SIO1 writes — invisible in PCSX.
-  On-screen debugging instead uses **GPU breadcrumbs**: tiny A0 uploads
-  (completing an A0 is what makes peops schedule a presentation; fill
-  rectangles do not trigger a flip) whose colors show the boot stage in
-  the frontend's frame dumps.
+  userspace printf falls back to raw SIO1 writes, which the harness's
+  `sio.c` echo patch mirrors into the PCSX log (the F-line diagnostics
+  arrive that way).  The GPU breadcrumb marks that early bring-up used
+  to localize hangs in frame dumps were removed once the console path
+  worked end to end.
 
 ## Harness notes (PCSX ReARMed)
 
@@ -179,3 +181,38 @@ work belongs in `/opt/PSXLinux2`.
 | START      | pause / start       |
 | D-pad      | directions (2 pads) |
 | SELECT (hold 0.5 s) | exit      |
+| SELECT + START     | sound on/off |
+
+## Performance
+
+Under PCSX ReARMed's interpreter the guest runs at roughly real
+PlayStation speed, so the wall-clock frame rate is essentially
+`60 * 262 / t1` with `t1` the Timer-1 hblank count per frame reported
+by the F-line (a full-speed SMS frame needs 262).  Two things keep the
+per-frame cost down:
+
+- **Adaptive render skip**: while an iteration fits into two fields
+  (about 30 fps) every frame is drawn; once the emulator falls behind,
+  alternate frames skip `render_line` — never more than three in a row,
+  so the display cannot freeze.  The skipped frame's bitmap is simply
+  uploaded again, so both buffers always show the last rendered frame.
+  Upstream's PSX frontend shipped a fixed `frame_skip = 32`; this is
+  the same idea, self-tuned.
+- **Sound starts disabled**: the PSG update plus the SPU streaming
+  cost about 16% of a frame, and most host setups have no audible SPU
+  output anyway.  The buffers are still allocated, so SELECT+START
+  toggles the stream at any time.
+
+Measured with Alex Kidd under PCSX (t1 ticks per frame, fps):
+
+| scene                  | before   | after    |
+|------------------------|----------|----------|
+| attract / light play   | 772, 20  | 527, ~30 |
+| mid game               | 906, 17  | 638, ~25 |
+| heavy scrolling        | 1070, 15 | 727, ~22 |
+
+`-O2` and `-O3` build at the same wall speed; the build uses `-O2`
+because the smaller image leaves more room under the stack budget.
+The remaining cost is genuine emulation work: the Z80 executes about
+7000 real instructions (0 burned cycles) per frame, so there is no
+busy-wait left to short-circuit.
