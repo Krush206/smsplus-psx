@@ -3,12 +3,67 @@
 #include "psx.h"
 
 int frame_count = 0;
-int frame_skip  = 32;
+/*
+ * The original frontend drew a frame only once every 32 emulated
+ * frames.  That was necessary because update_video() submitted two GPU
+ * commands per SMS pixel.  The renderer below uploads an 8bpp texture
+ * and draws one sprite instead, so rendering every frame is practical.
+ */
+int frame_skip  = 1;
 int skip_flag   = 0;
 int exit_flag   = 0;
 byte base_rom[ROM_SIZE];
 byte bitmap_data[256 * 192];
 static unsigned char pad1[34],pad2[34];
+
+/* Keep the source image in 8bpp VRAM and use a 128 entry CLUT.  Render
+ * pixels carry palette, priority and sprite bits; duplicating each of the
+ * 32 palette entries four times makes those extra bits free to display. */
+#define TEX_X       512
+#define TEX_Y       0
+#define CLUT_X      512
+#define CLUT_Y      208
+#define TEX_TPAGE   (((TEX_X >> 6) & 0x0F) | (((TEX_Y >> 8) & 1) << 4) | (1 << 7))
+#define CLUT_ATTR   ((CLUT_Y << 6) | ((CLUT_X >> 4) & 0x3F))
+
+static word clut_data[128];
+
+/*
+ * Upload a 16-bit VRAM image.  For an 8bpp texture, w is expressed in
+ * halfwords (two source bytes per halfword).  GP0 accepts two halfwords
+ * per 32-bit write, which is exactly the native layout of bitmap.data on
+ * this little-endian target.
+ */
+static void upload_image(int x, int y, int w, int h, const void *data)
+{
+    const dword *src = (const dword *)data;
+    int words = ((w * h) + 1) >> 1;
+
+    gp0 = 0xA0000000;
+    gp0 = PKT_XY(x, y);
+    gp0 = PKT_WH(w, h);
+
+    while(words--)
+        gp0 = *src++;
+}
+
+static void update_palette(void)
+{
+    int i;
+
+    for(i = 0; i < 128; i += 1)
+    {
+        int c = i & PIXEL_MASK;
+        int r = bitmap.pal.color[c][0] >> 3;
+        int g = bitmap.pal.color[c][1] >> 3;
+        int b = bitmap.pal.color[c][2] >> 3;
+
+        /* PSX VRAM colours are BGR555, unlike the core's RGB888 palette. */
+        clut_data[i] = (b << 10) | (g << 5) | r;
+    }
+
+    upload_image(CLUT_X, CLUT_Y, 128, 1, clut_data);
+}
 
 
 int main (void)
@@ -63,7 +118,8 @@ void init_machine(void)
     gp1 = 0x08000000;
 
     /* Clear framebuffer */
-    fb_rect(0, 0, 0x3FF, 0x1FF, 0x1F, 0x1F, 0x1F);
+    /* Palette entry zero is transparent in the GPU's textured path. */
+    fb_rect(0, 0, 0x3FF, 0x1FF, 0, 0, 0);
 
     /* Initialize display bitmap */
     memset(&bitmap, 0, sizeof(t_bitmap));
@@ -85,39 +141,35 @@ void trash_machine(void)
 
 void update_video(void)
 {
-    int x, y, c, r, g, b;
+    int w = cart.type ? 160 : 256;
+    int h = cart.type ? 144 : 192;
+    int dx = cart.type ? 48 : 0;
+    int dy = cart.type ? 48 : 24;
 
-    /* Width and height of viewport */
-    int w = (cart.type ? 160 : 256);
-    int h = (cart.type ? 144 : 192);
+    update_palette();
 
-    /* Offset in framebuffer */
-    int dx = (cart.type ? 48 : 0);
-    int dy = (cart.type ? 48 : 24);
-
-    /* Offset in display bitmap */
-    int sx = (cart.type ? 48 : 0);
-    int sy = (cart.type ? 24 : 0);
-
-    for(y = 0; y < h; y += 1)
+    if(cart.type)
     {
-        /* Point to current line of bitmap */
-        char *p = &bitmap.data[((sy + y) * bitmap.width) + (sx)];
-
-        for(x = 0; x < w; x += 1)
-        {
-            /* Strip priority and sprite marker bits */
-            c = (p[x] & PIXEL_MASK);
-
-            /* Look-up color components for given pixel */
-            r = bitmap.pal.color[c][0];
-            g = bitmap.pal.color[c][1];
-            b = bitmap.pal.color[c][2];
-
-            /* Write to framebuffer */
-            putpixel(dx + x, dy + y, r, g, b);
-        }
+        /* Game Gear's viewport is inset in the core's 256-pixel bitmap.
+         * Its rows are not contiguous, so transfer each 160-byte row. */
+        int y;
+        for(y = 0; y < h; y += 1)
+            upload_image(TEX_X, TEX_Y + y, w >> 1, 1,
+                         bitmap.data + ((y + 24) * bitmap.width) + 48);
     }
+    else
+    {
+        /* 256 pixels at 8bpp is 128 VRAM halfwords per scanline. */
+        upload_image(TEX_X, TEX_Y, w >> 1, h, bitmap.data);
+    }
+
+    /* Draw one unmodulated 8bpp textured sprite.  This replaces 49,152
+     * individual pixel primitives (98,304 GP0 writes) with four words. */
+    gp0 = 0xE1000000 | TEX_TPAGE;
+    gp0 = 0x64808080;
+    gp0 = PKT_XY(dx, dy);
+    gp0 = (CLUT_ATTR << 16);
+    gp0 = PKT_WH(w, h);
 }
 
 
