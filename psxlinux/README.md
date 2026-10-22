@@ -58,7 +58,7 @@ allocator hands out from the top of RAM (free zone ~0x1B2000..0x200000,
 "312k available" on the stock kernel), so a too-large bss overlaps
 live kernel data (bss zeroing then panics the kernel).  Boot-load
 probes on the stock kernel validated image+stack up to ~0x1860F0; the
-current binary ends at ~0x1A8878 (stack top ~0x1AE878) which has
+current binary ends at ~0x1A98CC (stack top ~0x1AF8CC) which has
 proven stable — keep new static buffers small and check the LOAD
 segment `MemSiz` after touching any buffer.
 
@@ -97,10 +97,23 @@ real-hardware smsplus PSX port (`../psx/psx.c`).
 - **Textured rectangles (0x64)**: the CLUT attribute lives in bits
   16-31 of the UV word: `(clut_attr<<16) | (v<<8) | u`, where
   `clut_attr = (cy<<6)|((cx>>4)&0x3F)`.
-- 8bpp texture at halfword (512,0), CLUT at (512,208); two 128-texel
-  sprites (tpages 0x88/0x89, bit7 = 8bpp color mode) scaled x1.25 to
-  320x240 (SMS) or 200x180 centered (GG), double buffered at display
-  y 0/240.
+- **4bpp textures** (used by the SMS tile renderer): one pattern is
+  32 bytes; the A0 header is the same three-word form.  peops' 4bpp
+  sampler takes texel `2b` from the **low** nibble of byte b and
+  texel `2b+1` from the high nibble (verified against
+  `drawPoly4TEx4` in `plugins/dfxvideo/soft.c`), and addresses
+  texel (u,v) at VRAM byte `v*2048 + (xbase<<1) + u/2` - i.e. texture
+  rows stride the full 1024-halfword VRAM width, so a 4bpp texture
+  page only occupies 64 halfwords of each row.
+- **Draw coordinates are integer pixels**: the GPU's polygon and
+  rectangle coordinates carry no subpixel fraction (a value packed
+  as 1/8-pixel eighths lands at 8x the intended position).
+- **Display 256x240** (`GP1(08) = 0x08000000`, like the original
+  `psx/psx.c` frontend): the SMS's own 256-pixel width, which lets
+  every tile be drawn 1:1 with the 4-word rectangle primitive.
+  Double buffered at display y 0/240; tile patterns cached in VRAM
+  as 4bpp textures on pages 0x05..0x08 (flip variants), CLUTs at
+  (512,208).
 - **GPUSTAT waits**: PCSX only exposes bit28 as "ready to receive";
   waiting on bit29 hangs forever.  Every wait in this port is bounded.
   Bit26 ("drawing") is polled with a timeout only.
@@ -188,31 +201,35 @@ work belongs in `/opt/PSXLinux2`.
 Under PCSX ReARMed's interpreter the guest runs at roughly real
 PlayStation speed, so the wall-clock frame rate is essentially
 `60 * 262 / t1` with `t1` the Timer-1 hblank count per frame reported
-by the F-line (a full-speed SMS frame needs 262).  Two things keep the
-per-frame cost down:
+by the F-line (a full-speed SMS frame needs 262).
 
-- **Adaptive render skip**: while an iteration fits into two fields
-  (about 30 fps) every frame is drawn; once the emulator falls behind,
-  alternate frames skip `render_line` — never more than three in a row,
-  so the display cannot freeze.  The skipped frame's bitmap is simply
-  uploaded again, so both buffers always show the last rendered frame.
-  Upstream's PSX frontend shipped a fixed `frame_skip = 32`; this is
-  the same idea, self-tuned.
+- **SMS frames are drawn by the GPU itself** (`tiles_submit_frame`):
+  the software renderer's per-pixel memory traffic — measured at
+  230-480 of a frame's ~550 ticks — is replaced by ~770 textured
+  rectangles, one per visible name-table entry, into a 256x240
+  display.  Pattern data is cached in VRAM as 4bpp textures; a
+  variant is re-uploaded lazily, inside the frame's packet list, only
+  when a quad first samples it after the game rewrites it.  The whole
+  list reaches the GPU with one DMA.
 - **Sound starts disabled**: the PSG update plus the SPU streaming
   cost about 16% of a frame, and most host setups have no audible SPU
   output anyway.  The buffers are still allocated, so SELECT+START
   toggles the stream at any time.
+- **Game Gear and raster effects** use the software bitmap path
+  (`render_line` plus a 1:1 textured quad), and so do SMS frames that
+  follow a mid-frame scroll-register write (flagged by the
+  `vdp_raster` hook in `vdp.c`).
 
 Measured with Alex Kidd under PCSX (t1 ticks per frame, fps):
 
-| scene                  | before   | after    |
-|------------------------|----------|----------|
-| attract / light play   | 772, 20  | 527, ~30 |
-| mid game               | 906, 17  | 638, ~25 |
-| heavy scrolling        | 1070, 15 | 727, ~22 |
+| scene                | software path   | GPU tile path   |
+|----------------------|-----------------|-----------------|
+| title / attract      | 772-906, 17-20  | 556-566, ~28    |
+| scrolled demo        | 953-1070, 15-17 | 563-566, ~28    |
+| early play           | 658, 23         | 400-517, 30-39  |
 
-`-O2` and `-O3` build at the same wall speed; the build uses `-O2`
-because the smaller image leaves more room under the stack budget.
 The remaining cost is genuine emulation work: the Z80 executes about
-7000 real instructions (0 burned cycles) per frame, so there is no
-busy-wait left to short-circuit.
+7000 real instructions (0 burned cycles) per frame, ~473 ticks, and
+the tile list build plus VRAM refresh costs ~80.  `-O2` and `-O3`
+build at the same wall speed (including `-O3` on the Z80 object
+alone), so the build uses `-O2` to stay under the stack budget.
