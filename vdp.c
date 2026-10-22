@@ -28,6 +28,11 @@ byte vcnt[0x200] =
     0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF,
 };
 
+/* PSXLinux port: set by vdp_write() when a scroll register changes
+ * during the active display; the GPU tile renderer falls back to the
+ * software path for the next frame when it sees this. */
+int vdp_raster;
+
 /* Return values from the H counter */
 byte hcnt[0x200] =
 {
@@ -99,6 +104,14 @@ void vdp_ctrl_w(int data)
 
             /* Store register data */
             vdp.reg[r] = d;
+
+            /* PSXLinux port: the GPU tile renderer builds one display
+             * list per frame, so a scroll register written while the
+             * active display is being traced is a mid-frame raster
+             * effect it cannot express.  Flag it; the frontend then
+             * renders the next frame with the software path instead. */
+            if ((r == 0 || r == 8 || r == 9) && vdp.line < 192)
+                vdp_raster = 1;
 
             /* Update table addresses */
             vdp.ntab = (vdp.reg[2] << 10) & 0x3800;
