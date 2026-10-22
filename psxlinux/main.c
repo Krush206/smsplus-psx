@@ -37,7 +37,7 @@ static int sys_lseek(int fd, int offset, int whence)
  * plus emulator contexts leave room, so the ROM buffer is 128K after
  * that: larger SMS images (256K/512K) are not supported here. */
 #define ROM_SIZE    (128 * 1024)
-#define CONSOLE_W   320
+#define CONSOLE_W   256
 #define CONSOLE_H   240
 
 /* VRAM layout */
@@ -58,6 +58,11 @@ static int back_y;                  /* buffer being drawn into            */
 static int front_y;                 /* buffer currently shown on screen   */
 static int game_activity;           /* bit0: game wrote CRAM (palette)    */
 static unsigned page_sums[8];       /* ROM per-16K-page checksums (loader proof) */
+/* The GPU keeps these resources in VRAM across buffer flips.  An
+ * adaptively skipped core render leaves the bitmap untouched, so avoid
+ * submitting the same 24 KiB texture again on those frames. */
+static int texture_dirty = 1;
+static int clut_valid;
 
 static void rom_checksums(void)
 {
@@ -212,7 +217,7 @@ static void gpu_init(void)
     GP1 = 0x03000000;                   /* display enable */
     GP1 = 0x06C60260;                   /* 320 pixel horizontal range */
     GP1 = 0x07040010;                   /* 240 line vertical range */
-    GP1 = 0x08000001;                   /* 320x240, 15bpp, NTSC */
+    GP1 = 0x08000000;                   /* 256x240, 15bpp, NTSC */
     GP1 = 0x05000000;                   /* display area (0,0) */
 
     /* clip both buffers and use an absolute (0,0) offset for the
@@ -337,6 +342,310 @@ static void draw_bitmap_quad(int tex_w, int tex_h, int dst_w, int dst_h,
 }
 
 /* ------------------------------------------------------------------ */
+/* GPU tile renderer (SMS)                                             */
+/* ------------------------------------------------------------------ */
+
+/* The PSX GPU draws the SMS picture itself: every 8x8 pattern lives in
+ * VRAM as a 4bpp texture and every on-screen tile is a textured quad.
+ * That removes the software renderer's per-pixel memory traffic, which
+ * measurement showed to be the most expensive part of a frame under
+ * the host interpreter.  Behaviour mirrors render.c:
+ *
+ *   - a background texel 0 shows its bank's palette entry 0 (opaque);
+ *     a sprite texel 0 never writes (the LUT leaves the background),
+ *   - a priority tile (name bit 12) wins over every sprite pixel: the
+ *     software LUT returns the input for pixels marked 0x40, so
+ *     priority tiles are drawn in a second pass after the sprites,
+ *   - sprites are drawn back to front, so the first sprite of the
+ *     list keeps its pixels, like the LUT's "sprite already here" rule.
+ *
+ * Not reproduced: the per-line sprite limit (purely visual), the sprite
+ * collision flag and per-line palette changes.  A game writing the
+ * scroll registers during the active display is caught by the
+ * vdp_raster hook (vdp.c) and served by the software path on the next
+ * frame. */
+
+#define TILE_TPAGE      0x05            /* 4bpp pages: +0 none, +1 H, +2 V, +3 HV */
+#define TILE_HW         320             /* halfword x of pattern page 0x05 */
+#define TILE_CLUT_N0    CLUT_ATTR       /* bank 0 tiles: entry 0 opaque */
+#define TILE_CLUT_N1    (CLUT_ATTR + 1) /* bank 1 tiles: entry 0 opaque */
+#define TILE_CLUT_S     (CLUT_ATTR + 2) /* sprites: entry 0 transparent */
+
+static int gpu_tiles;                    /* this frame uses the tile path */
+static int raster_pending;               /* last frame saw a raster effect */
+static int raster_reported;
+static int tile_clut_valid;
+static int was_gpu;                      /* tile path used by the last frame */
+static int gpu_quads;                    /* diagnostics: quads per window */
+
+extern int vdp_raster;                   /* set by vdp_ctrl_w() in vdp.c */
+extern byte vram_dirty[];                /* render.c, one flag per pattern */
+extern byte is_vram_dirty;
+
+/* CRAM entry (2 bits per gun, as palette_sync decodes it) to a PSX
+ * 15bpp halfword with the STP bit set: only an exact 0x0000 CLUT entry
+ * is transparent, so a game colour of pure black must not map to the
+ * bare colour (it would punch a hole to the backdrop).  The software
+ * path never noticed because its clear fill was black anyway. */
+static unsigned cram15(unsigned c)
+{
+    return 0x8000u | (((c >> 0) & 3) << 3) | (((c >> 2) & 3) << 8) |
+           (((c >> 4) & 3) << 13);
+}
+
+/* Fill command word for the backdrop colour (palette entry 16 +
+ * reg[7], i.e. BACKDROP_COLOR). */
+static unsigned backdrop_fill(void)
+{
+    unsigned c = vdp.cram[0x10 | (vdp.reg[7] & 0x0F)];
+    unsigned r = ((c >> 0) & 3) << 6;    /* fill fields are 8 bit */
+    unsigned g = ((c >> 2) & 3) << 6;
+    unsigned b = ((c >> 4) & 3) << 6;
+
+    return 0x02000000u | (b << 16) | (g << 8) | r;
+}
+
+/* Pack one 8x8 pattern (four bit planes) into 32 bytes of 4bpp texels,
+ * optionally mirrored.  A halfword holds four texels; peops' 4bpp
+ * sampler takes texel 2b from the LOW nibble of byte b and texel
+ * 2b+1 from the high nibble. */
+static void tile_pack(unsigned *dst, int n, int fh, int fv)
+{
+    const unsigned char *p = &vdp.vram[(n & 0x1FF) << 5];
+    unsigned char *out = (unsigned char *)dst;
+    int r;
+
+    memset(out, 0, 32);
+    for (r = 0; r < 8; r += 1) {
+        const unsigned char *row = &p[(fv ? 7 - r : r) << 2];
+        unsigned b0 = row[0], b1 = row[1], b2 = row[2], b3 = row[3];
+        unsigned char *o = &out[r << 2];
+        int x;
+
+        for (x = 0; x < 8; x += 1) {
+            int sx = fh ? 7 - x : x;
+            unsigned t = (((b0 >> (7 - sx)) & 1) << 0) |
+                         (((b1 >> (7 - sx)) & 1) << 1) |
+                         (((b2 >> (7 - sx)) & 1) << 2) |
+                         (((b3 >> (7 - sx)) & 1) << 3);
+            o[x >> 1] |= (unsigned char)(t << ((x & 1) ? 4 : 0));
+        }
+    }
+}
+
+
+/* Per-pattern staleness of the four mirrored copies (bits: 1 none,
+ * 2 H, 4 V, 8 HV).  A variant is uploaded lazily, into the frame's
+ * packet list, the first time a quad samples it after a rewrite -
+ * animated games only pay for the variants they actually show.  The
+ * scratch pattern buffer lives on the stack. */
+static unsigned char tile_stale[0x200];
+
+/* Append the A0 that refreshes one variant of pattern n (pack +
+ * transfer), and clear its stale bit.  The A0 header is three words:
+ * command, (y<<16)|x, (h<<16)|w - same as the proven vram_upload_img. */
+static unsigned *tile_refresh(unsigned *pk, int n, int variant)
+{
+    unsigned pat[8];                     /* 32 bytes of 4bpp texels */
+
+    tile_pack(pat, n, variant & 1, variant >> 1);
+    pk[0] = 0xA0000000u;
+    pk[1] = ((unsigned)((n >> 5) << 3) << 16)
+          | (unsigned)(TILE_HW + (variant << 6) + ((n & 31) << 1));
+    pk[2] = (8u << 16) | 2u;             /* h = 8 rows, w = 2 halfwords */
+    memcpy(&pk[3], pat, 32);
+    tile_stale[n] &= (unsigned char)~(1u << variant);
+    return pk + 11;
+}
+
+/* Refresh the three tile CLUTs (48 halfwords at the old CLUT spot).
+ * Entries are plain opaque colours like the proven 8bpp CLUT; the
+ * sprite CLUT's entry 0 is 0x0000, the only fully transparent value. */
+static void tiles_update_clut(void)
+{
+    static unsigned short hw[48];
+    int i;
+
+    if (tile_clut_valid && !bitmap.pal.update)
+        return;
+    if (bitmap.pal.update)
+        game_activity |= 1;              /* game wrote its palette */
+    bitmap.pal.update = 0;
+    tile_clut_valid = 1;
+
+    for (i = 0; i < 16; i += 1) {
+        unsigned c1 = cram15(vdp.cram[0x10 + i]);
+
+        hw[i] = cram15(vdp.cram[i]);     /* tiles, bank 0 */
+        hw[16 + i] = c1;                 /* tiles, bank 1 */
+        hw[32 + i] = i ? c1 : 0x0000;    /* sprites: 0 = transparent */
+    }
+    vram_upload_img(CLUT_X, CLUT_Y, 48, 1, hw, 96);
+}
+
+/* One E1 texture-page select + one textured rectangle: the tile
+ * cache's flip variants live on different pages, and rectangles take
+ * their page from the global register only. */
+static unsigned *rect_put(unsigned *pk, int x, int y, int w, int h,
+                          int u, int v, unsigned tpage, unsigned clut)
+{
+    pk[0] = 0xE1000000u | tpage;
+    pk[1] = 0x64808080u;                 /* textured rect, identity modulate */
+    pk[2] = ((unsigned)y << 16) | (unsigned)(x & 0xFFFF);
+    pk[3] = (clut << 16) | ((unsigned)v << 8) | (unsigned)u;
+    pk[4] = ((unsigned)h << 16) | (unsigned)w;
+    gpu_quads += 1;
+    return pk + 5;
+}
+
+/* Build and submit one frame: backdrop fill, plain background tiles,
+ * sprites (back to front), priority tiles, and the blank left column.
+ * The name-table walk mirrors render_bg_sms:
+ *
+ *   attr       = nt[((k + vs>>3) % 28) * 32 + (j + hs>>3) & 31]
+ *   screen pos = (j*8 - hs&7, k*8 - vs&7)  [bitmap pixels]
+ *
+ * with hs forced to 0 for the top two tile rows when reg[0] bit 6 is
+ * set, and vs frozen to 0 for screen columns >= 24 when bit 7 is set.
+ * The list is bounded by construction: 25x34 tiles + 64x2 sprites. */
+static void tiles_submit_frame(int yoff)
+{
+    unsigned *pk = (unsigned *)bitmap.data;
+    unsigned *prio = pk + 11200;         /* side list: priority tiles */
+    unsigned fill = backdrop_fill();
+    int hs = (0x100 - vdp.reg[8]) & 0xFF;
+    int vs = vdp.reg[9];
+    int display = (vdp.reg[1] & 0x40) && (vdp.reg[2] & 1);
+    int lock_v = vdp.reg[0] & 0x80;
+    int lock_h = vdp.reg[0] & 0x40;
+    int k, j, i, x, nprio = 0;
+
+    *pk++ = fill;                         /* backdrop fill, absolute xy */
+    *pk++ = (unsigned)(back_y + yoff) << 16;
+    *pk++ = ((unsigned)(CONSOLE_H - yoff) << 16) | (unsigned)CONSOLE_W;
+
+    if (display) {
+        const word *nt0 = (const word *)&vdp.vram[vdp.ntab];
+        int vrow = vs >> 3;                    /* whole-tile v scroll */
+        int yfin = vs & 7;                     /* fine v scroll, px */
+
+        /* Pass 1: plain tiles straight into the list; priority tiles
+         * are parked in a side list (attr + position, one word each)
+         * and drawn after the sprites - the software LUT's rule that a
+         * pixel marked 0x40 is final. */
+        for (k = 0; k < 25; k += 1) {
+            int hsl = (lock_h && k < 2) ? 0 : hs;
+            int xoff = hsl & 7;                    /* fine h scroll, px */
+            int col0 = hsl >> 3;
+            const word *ntr = nt0 + (((k + vrow) % 28) << 5);
+            const word *ntr_locked = nt0 + (k << 5);
+            int y = 8 * k - yfin + yoff;
+
+            for (j = -1, x = -8 - xoff; j < 33; j += 1, x += 8) {
+                int col = (j + col0) & 0x1F;
+                word attr = (lock_v && (j >= 24)) ? ntr_locked[col & 0x1F]
+                                                  : ntr[col & 0x1F];
+                int n = attr & 0x1FF;
+                int variant = ((attr >> 9) & 1) + ((attr >> 10) & 1) * 2;
+                unsigned tp = TILE_TPAGE + variant;
+                unsigned cl = (attr & 0x800) ? TILE_CLUT_N1 : TILE_CLUT_N0;
+                int yy = (lock_v && (j >= 24)) ? 8 * k + yoff : y;
+
+                if (vram_dirty[n]) {
+                    tile_stale[n] = 0x0F;    /* the game redrew it */
+                    vram_dirty[n] = 0;
+                }
+                if (tile_stale[n] & (1u << variant))
+                    pk = tile_refresh(pk, n, variant);
+                if (attr & 0x1000) {
+                    prio[nprio++] = (unsigned)(attr & 0x1FFF)
+                                  | ((unsigned)(x + 8) << 16)
+                                  | ((unsigned)k << 25);
+                } else {
+                    pk = rect_put(pk, x, yy, 8, 8,
+                                  (n & 31) << 3, (n >> 5) << 3, tp, cl);
+                }
+            }
+        }
+
+        /* Sprites, back to front so the first of the list wins.
+         * Sizes follow render_obj: zoom (reg[1] bit 0) doubles both
+         * axes of the 8x8 pattern, 8x16 mode (bit 1) stacks patterns
+         * n and n+1 vertically. */
+        {
+            const byte *st = (const byte *)&vdp.vram[vdp.satb];
+            int zoom = vdp.reg[1] & 0x01;
+            int tall = vdp.reg[1] & 0x02;
+            int r;
+
+            i = 0;
+            while ((i < 64) && (st[i] != 208))
+                i += 1;
+
+            for (i = i - 1; i >= 0; i -= 1) {
+                int yp = st[i] + 1;
+                int xp = st[0x80 + (i << 1)];
+                int n = st[0x81 + (i << 1)];
+                int w = zoom ? 16 : 8;     /* screen px */
+                int h = zoom ? 16 : 8;
+                int rows = tall ? 2 : 1;
+
+                if (yp > 240) yp -= 256;
+                if (vdp.reg[0] & 0x08) xp -= 8;
+                if (vdp.reg[6] & 0x04) n |= 0x0100;
+                if (tall) n &= 0x01FE;
+
+                for (r = 0; r < rows; r += 1) {
+                    int pn = n + r;
+
+                    /* sprites share the tile cache; refresh their
+                     * pattern lazily like the background does */
+                    if (vram_dirty[pn]) {
+                        tile_stale[pn] = 0x0F;
+                        vram_dirty[pn] = 0;
+                    }
+                    if (tile_stale[pn] & 1u)   /* sprites never flip */
+                        pk = tile_refresh(pk, pn, 0);
+
+                    pk = rect_put(pk, xp, yp + r * 8 + yoff, w, h,
+                                  (pn & 31) << 3, (pn >> 5) << 3,
+                                  TILE_TPAGE, TILE_CLUT_S);
+                }
+            }
+        }
+
+        /* Pass 2: the parked priority tiles, over the sprites. */
+        for (i = 0; i < nprio; i += 1) {
+            unsigned e = prio[i];
+            int n = e & 0x1FF;
+            int x = (int)((e >> 16) & 0x1FF) - 8;
+            int kk = (int)((e >> 25) & 0x1F);
+            int yfin = vs & 7;
+            int yy = ((lock_v && (((e >> 16) & 0x1FF) - 8) >= 24)
+                      ? 8 * kk : 8 * kk - yfin) + yoff;
+            int variant = ((e >> 9) & 1) + ((e >> 10) & 1) * 2;
+            unsigned tp = TILE_TPAGE + variant;
+            unsigned cl = (e & 0x800) ? TILE_CLUT_N1 : TILE_CLUT_N0;
+
+            if (tile_stale[n] & (1u << variant))
+                pk = tile_refresh(pk, n, variant);
+            pk = rect_put(pk, x, yy, 8, 8,
+                          (n & 31) << 3, (n >> 5) << 3, tp, cl);
+        }
+    }
+
+    if (display && (vdp.reg[0] & 0x20)) {
+        /* blank the leftmost column (8 bitmap pixels = 10 screen) */
+        *pk++ = fill;
+        *pk++ = (unsigned)(back_y + yoff) << 16;
+        *pk++ = ((unsigned)(CONSOLE_H - yoff) << 16) | 8u;
+    }
+
+    dma_to_gpu((unsigned *)bitmap.data, pk - (unsigned *)bitmap.data);
+}
+
+
+/* ------------------------------------------------------------------ */
 /* video                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -345,14 +654,13 @@ static void update_clut(void)
     static unsigned short clut_hw[128];
     int i;
 
-    /* always re-upload: 128 halfwords per frame is free compared with
-     * the 24K halfword texture, and it makes the palette independent
-     * of the core's dirty flag (a never-cleared flag used to leave the
-     * GPU CLUT all zero, which makes every texel fully transparent and
-     * the whole screen black) */
-    if (bitmap.pal.update) {
-        game_activity |= 1;                 /* game wrote its palette */
+    if (!clut_valid || bitmap.pal.update) {
+        if (bitmap.pal.update)
+            game_activity |= 1;             /* game wrote its palette */
         bitmap.pal.update = 0;
+        clut_valid = 1;
+    } else {
+        return;
     }
 
     for (i = 0; i < 128; i++) {
@@ -374,14 +682,36 @@ static void update_video(void)
     set_draw_area();
     set_draw_offset();
 
-    /* GPU idle before touching texture; then refresh CLUT + texture */
-    drawsync_wait();
+    if (gpu_tiles) {
+        /* SMS frame drawn by the GPU: refresh the tile cache and the
+         * CLUTs, then submit one packet list (backdrop fill, tiles,
+         * sprites, priority tiles) straight into the back buffer.
+         * The 8bpp bitmap is unused here and its storage serves as
+         * the packet scratch space. */
+        if (!was_gpu) {
+            /* the software path overwrote our VRAM: repaint it all */
+            memset(tile_stale, 0x0F, sizeof(tile_stale));
+            tile_clut_valid = 0;
+        }
+        was_gpu = 1;
+        clut_valid = 0;   /* its 128-entry CLUT replaced ours */
 
+        tiles_update_clut();
+        tiles_submit_frame(0);
+        return;
+    }
+    was_gpu = 0;
+
+    /* The main loop waited for the previous buffer before flipping it,
+     * so this buffer's GPU work is already complete here. */
     update_clut();
 
     w_tex = cart.type ? 160 : 256;
     h_tex = cart.type ? 144 : 192;
-    vram_upload_img(TEX_X, TEX_Y, w_tex / 2, h_tex, bitmap.data, bitmap.pitch);
+    if (texture_dirty) {
+        vram_upload_img(TEX_X, TEX_Y, w_tex / 2, h_tex, bitmap.data, bitmap.pitch);
+        texture_dirty = 0;
+    }
 
     /* clear the logical back buffer: fill packets use absolute
      * coordinates and ignore the draw offset */
@@ -389,10 +719,10 @@ static void update_video(void)
     gp0_cmd((unsigned)back_y << 16);
     gp0_cmd(((unsigned)CONSOLE_H << 16) | (unsigned)CONSOLE_W);
 
-    /* present: stretch the bitmap to the full display with a textured
-     * quad (a rectangle cannot scale: it samples U/V 1:1 per pixel) */
-    w_dst = (w_tex * 5) / 4;
-    h_dst = (h_tex * 5) / 4;
+    /* present: the display is the bitmap's own size (256 wide like the
+     * SMS), so a 1:1 textured quad centers it vertically */
+    w_dst = w_tex;
+    h_dst = h_tex;
     draw_bitmap_quad(w_tex, h_tex, w_dst, h_dst, TEX_TPAGE, CLUT_ATTR);
 }
 
@@ -670,12 +1000,11 @@ void system_load_sram(void)
 
 int main(int argc, char *argv[])
 {
-    /* Minimal GPU bring-up first so the breadcrumb marks themselves
-     * become visible: reset, display on, 320x240, display area (0,0),
-     * clip 0..320/0..240, no offset. */
+    /* Minimal GPU bring-up first: reset, display on, 256x240 (the
+     * SMS's native width), display area (0,0), no offset. */
     GP1 = 0x00000000;
     GP1 = 0x03000000;
-    GP1 = 0x08000001;
+    GP1 = 0x08000000;
     GP1 = 0x05000000;
     GP0 = 0xE3000000;
     GP0 = 0xE4000000 | ((unsigned)CONSOLE_H << 10) | CONSOLE_W;
@@ -719,6 +1048,7 @@ int main(int argc, char *argv[])
         unsigned frame = 0;
         unsigned t_video = 0, t_sms = 0, t_loop = 0;
         unsigned t_wait = 0, t_in = 0, t_spu = 0;
+        unsigned t_sr = 0, t_ss = 0;         /* rendered / skipped frame cost */
         unsigned prev_top = T1_COUNT;  /* loop start of last iteration */
         unsigned iter_ticks = 0;       /* its length in hblank ticks */
         int skip_run = 0;              /* consecutive skipped renders */
@@ -741,6 +1071,18 @@ int main(int argc, char *argv[])
             t0_loop = T1_COUNT;
             iter_ticks = (unsigned short)(t0_loop - prev_top);
             prev_top = t0_loop;
+
+            /* Path decision: SMS frames are drawn by the GPU tile
+             * renderer; Game Gear, and SMS frames following a
+             * mid-frame scroll change (raster effect, flagged from
+             * vdp_ctrl_w), use the software bitmap path. */
+            gpu_tiles = (cart.type == TYPE_SMS) && !raster_pending;
+            raster_pending = vdp_raster;
+            vdp_raster = 0;
+            if (raster_pending && !raster_reported) {
+                raster_reported = 1;
+                printf("raster effect: software renderer fallback\n");
+            }
 
             /* Make sure the GPU finished the frame we are about to show
              * (bounded), then wait out one field period (Timer 1). */
@@ -771,20 +1113,27 @@ int main(int argc, char *argv[])
             }
 
             /* Run the SMS emulation for a frame.  Rendering is skipped
-             * adaptively: while an iteration fits into two fields
-             * (about 30 fps) every frame is drawn, and once the
-             * emulator falls behind alternate frames drop their
-             * rendering - never more than three in a row, so the
-             * display can not freeze - trading display rate for game
-             * speed.  (Upstream's PSX frontend shipped a fixed
-             * frame_skip = 32, i.e. it drew one frame in 32.) */
+             * as soon as an iteration misses a 60 Hz field.  The old
+             * two-field threshold kept rendering at 22-30 fps even
+             * though it was exactly the work preventing the emulator
+             * from catching up.  Never skip more than three frames in
+             * a row: game logic stays at full rate and the display
+             * cannot freeze indefinitely. */
             {
                 unsigned t0 = T1_COUNT;
-                int skip = (iter_ticks >= 2 * HBLANKS_FRAME) && (skip_run < 3);
+                int skip = (iter_ticks > HBLANKS_FRAME) && (skip_run < 3);
 
+                if (gpu_tiles)
+                    skip = 0;             /* no software render to skip */
                 skip_run = skip ? skip_run + 1 : 0;
                 skip_count += skip;
-                sms_frame(skip);
+                sms_frame(gpu_tiles ? 1 : skip);
+                if (!gpu_tiles && !skip)
+                    texture_dirty = 1;
+                if (skip)
+                    t_ss += (unsigned short)(T1_COUNT - t0);
+                else
+                    t_sr += (unsigned short)(T1_COUNT - t0);
                 t_sms += (unsigned short)(T1_COUNT - t0);
             }
 
@@ -809,8 +1158,9 @@ int main(int argc, char *argv[])
                 for (i = 0; i < 256 * 192; i++)
                     if (bitmap.data[i])
                         nz++;
-                printf("F%u nz=%d t1=%u u=%u s=%u w=%u i=%u a=%u sk=%d act=%d st=%d p0=%02x%02x%02x\n",
-                       frame, nz, t_loop, t_video, t_sms,
+                printf("F%u nz=%d t1=%u u=%u s=%u sr=%u ss=%u gq=%d w=%u i=%u a=%u sk=%d act=%d st=%d p0=%02x%02x%02x\n",
+                       frame, nz, t_loop, t_video, t_sms, t_sr, t_ss,
+                       gpu_quads,
                        t_wait, t_in, t_spu, skip_count,
                        game_activity, pace_stalled,
                        bitmap.pal.color[0][0], bitmap.pal.color[0][1],
@@ -821,6 +1171,9 @@ int main(int argc, char *argv[])
                 t_wait = 0;
                 t_in = 0;
                 t_spu = 0;
+                t_sr = 0;
+                t_ss = 0;
+                gpu_quads = 0;
                 skip_count = 0;
             }
 
